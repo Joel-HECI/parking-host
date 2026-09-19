@@ -1,0 +1,8 @@
+{
+    "PARKING-ESP32-001": {
+        "token": "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET",
+        "name": "Parking Spot A-01",
+        "spot": "A-01",
+        "enabled": true
+    }
+}
