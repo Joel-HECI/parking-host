@@ -9,6 +9,12 @@ from pathlib import Path
 
 import websockets
 
+from db import (
+    authenticate_device,
+    insert_event,
+    update_last_seen,
+)
+
 
 # ============================================================
 # CONFIGURATION
@@ -22,12 +28,7 @@ WEBSOCKET_PATH = "/parking"
 SERVER_CERT = Path("certs/server.crt")
 SERVER_KEY = Path("certs/server.key")
 
-DEVICES_FILE = Path("devices.json")
-
 DATA_DIR = Path("data")
-SENSOR_LOG = DATA_DIR / "sensors.jsonl"
-VIDEO_LOG = DATA_DIR / "video.jsonl"
-
 FRAME_DIR = DATA_DIR / "frames"
 
 AUTH_TIMEOUT = 10
@@ -81,54 +82,6 @@ pending_video_metadata = {}
 
 
 # ============================================================
-# DEVICE REGISTRY
-# ============================================================
-
-def load_devices():
-    """
-    Load registered ESP32 devices from devices.json.
-    """
-
-    if not DEVICES_FILE.exists():
-
-        logger.error(
-            "Device registry not found: %s",
-            DEVICES_FILE,
-        )
-
-        return {}
-
-    try:
-
-        with open(
-            DEVICES_FILE,
-            "r",
-            encoding="utf-8",
-        ) as file:
-
-            devices = json.load(file)
-
-        if not isinstance(devices, dict):
-
-            logger.error(
-                "devices.json must contain a JSON object"
-            )
-
-            return {}
-
-        return devices
-
-    except Exception as exc:
-
-        logger.error(
-            "Failed to load devices.json: %s",
-            exc,
-        )
-
-        return {}
-
-
-# ============================================================
 # TIME
 # ============================================================
 
@@ -144,39 +97,22 @@ def utc_timestamp():
     )
 
 
-# ============================================================
-# JSONL LOGGING
-# ============================================================
+def parse_timestamp(value):
+    """Parse an ISO-8601 timestamp received from an ESP32."""
 
-def append_jsonl(path: Path, data: dict):
-    """
-    Append a JSON object to a JSON Lines file.
-    """
+    if not value:
+        return None
 
     try:
-
-        with open(
-            path,
-            "a",
-            encoding="utf-8",
-        ) as file:
-
-            file.write(
-                json.dumps(
-                    data,
-                    separators=(",", ":"),
-                )
-            )
-
-            file.write("\n")
-
-    except Exception as exc:
-
-        logger.error(
-            "Failed to write %s: %s",
-            path,
-            exc,
+        return datetime.fromisoformat(
+            value.replace("Z", "+00:00")
         )
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid device timestamp: %r",
+            value,
+        )
+        return None
 
 
 # ============================================================
@@ -185,7 +121,8 @@ def append_jsonl(path: Path, data: dict):
 
 async def authenticate(websocket):
     """
-    Wait for the first message from the ESP32.
+    Wait for the first message from the ESP32 and authenticate
+    the device against PostgreSQL.
 
     Expected:
 
@@ -197,217 +134,156 @@ async def authenticate(websocket):
     """
 
     try:
-
         raw_message = await asyncio.wait_for(
             websocket.recv(),
             timeout=AUTH_TIMEOUT,
         )
 
     except asyncio.TimeoutError:
-
-        logger.warning(
-            "Authentication timeout"
-        )
-
+        logger.warning("Authentication timeout")
         await websocket.close(
             code=4001,
             reason="Authentication timeout",
         )
-
         return None
 
     except Exception as exc:
-
         logger.warning(
             "Failed to receive authentication: %s",
             exc,
         )
-
         return None
 
     if isinstance(raw_message, bytes):
-
         logger.warning(
             "Binary message received before authentication"
         )
-
         await websocket.close(
             code=4002,
             reason="Authentication required",
         )
-
         return None
 
     try:
-
         message = json.loads(raw_message)
-
     except json.JSONDecodeError:
-
-        logger.warning(
-            "Invalid JSON authentication message"
-        )
-
+        logger.warning("Invalid JSON authentication message")
         await websocket.close(
             code=4003,
             reason="Invalid authentication",
         )
-
         return None
 
     if message.get("type") != "auth":
-
-        logger.warning(
-            "First message was not authentication"
-        )
-
+        logger.warning("First message was not authentication")
         await websocket.close(
             code=4004,
             reason="Authentication required",
         )
-
         return None
 
     device_id = message.get("device_id")
     token = message.get("token")
 
     if not device_id or not token:
-
         logger.warning(
             "Authentication missing device_id or token"
         )
-
         await websocket.close(
             code=4005,
             reason="Invalid authentication",
         )
-
         return None
 
-    devices = load_devices()
-
-    device = devices.get(device_id)
+    try:
+        device = authenticate_device(
+            device_id,
+            token,
+        )
+    except Exception as exc:
+        logger.exception(
+            "Database authentication error for %s: %s",
+            device_id,
+            exc,
+        )
+        await websocket.send(
+            json.dumps({
+                "type": "auth_failed",
+                "reason": "server_error",
+            })
+        )
+        await websocket.close(
+            code=4500,
+            reason="Authentication service error",
+        )
+        return None
 
     if device is None:
-
         logger.warning(
-            "Unknown device attempted authentication: %s",
+            "Authentication failed for device: %s",
             device_id,
         )
-
         await websocket.send(
-            json.dumps(
-                {
-                    "type": "auth_failed",
-                    "reason": "unknown_device",
-                }
-            )
+            json.dumps({
+                "type": "auth_failed",
+                "reason": "invalid_credentials",
+            })
         )
-
-        await websocket.close(
-            code=4006,
-            reason="Unknown device",
-        )
-
-        return None
-
-    if not device.get("enabled", False):
-
-        logger.warning(
-            "Disabled device attempted authentication: %s",
-            device_id,
-        )
-
-        await websocket.send(
-            json.dumps(
-                {
-                    "type": "auth_failed",
-                    "reason": "device_disabled",
-                }
-            )
-        )
-
-        await websocket.close(
-            code=4007,
-            reason="Device disabled",
-        )
-
-        return None
-
-    expected_token = device.get("token")
-
-    if token != expected_token:
-
-        logger.warning(
-            "Invalid token for device: %s",
-            device_id,
-        )
-
-        await websocket.send(
-            json.dumps(
-                {
-                    "type": "auth_failed",
-                    "reason": "invalid_token",
-                }
-            )
-        )
-
         await websocket.close(
             code=4008,
-            reason="Invalid token",
+            reason="Authentication failed",
         )
-
         return None
-
-    # --------------------------------------------------------
-    # Authentication successful
-    # --------------------------------------------------------
 
     logger.info(
         "Device authenticated: %s (%s)",
-        device_id,
-        device.get("name", "unnamed"),
+        device["device_id"],
+        device.get("name") or "unnamed",
     )
 
-    # Disconnect an existing connection from the same device.
     old_websocket = connected_devices.get(device_id)
 
     if old_websocket is not None:
-
         logger.warning(
             "Device %s already connected. "
             "Closing previous connection.",
             device_id,
         )
-
         try:
-
             await old_websocket.close(
                 code=4010,
                 reason="New connection established",
             )
-
         except Exception:
             pass
 
     connected_devices[device_id] = websocket
 
+    now = utc_timestamp()
+
     device_sessions[device_id] = {
-        "device_id": device_id,
+        "device_id": device["device_id"],
         "name": device.get("name"),
         "spot": device.get("spot"),
-        "connected_at": utc_timestamp(),
-        "last_seen": utc_timestamp(),
+        "connected_at": now,
+        "last_seen": now,
     }
 
-    await websocket.send(
-        json.dumps(
-            {
-                "type": "auth_ok",
-                "device_id": device_id,
-                "server_time": utc_timestamp(),
-            }
+    try:
+        update_last_seen(device_id)
+    except Exception as exc:
+        logger.error(
+            "Failed to update last_seen for %s: %s",
+            device_id,
+            exc,
         )
+
+    await websocket.send(
+        json.dumps({
+            "type": "auth_ok",
+            "device_id": device_id,
+            "server_time": now,
+        })
     )
 
     return device_id
@@ -455,24 +331,36 @@ async def handle_sensor_message(
     device_id,
     message,
 ):
-    """
-    Handle sensor messages from an ESP32.
-    """
+    """Store a sensor event in PostgreSQL."""
 
-    device_sessions[device_id]["last_seen"] = utc_timestamp()
+    server_time = utc_timestamp()
+    message["server_timestamp"] = server_time
 
-    message["server_timestamp"] = utc_timestamp()
+    device_sessions[device_id]["last_seen"] = server_time
 
-    logger.info(
-        "Sensor from %s: %s",
-        device_id,
-        json.dumps(message),
-    )
+    try:
+        event_id = insert_event(
+            device_id=device_id,
+            event_type="sensor",
+            event_time=parse_timestamp(message.get("timestamp")),
+            payload=message,
+        )
 
-    append_jsonl(
-        SENSOR_LOG,
-        message,
-    )
+        update_last_seen(device_id)
+
+        logger.info(
+            "Sensor from %s stored as event %s: %s",
+            device_id,
+            event_id,
+            json.dumps(message),
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Failed to store sensor event from %s: %s",
+            device_id,
+            exc,
+        )
 
 
 # ============================================================
@@ -484,20 +372,40 @@ async def handle_status_message(
     device_id,
     message,
 ):
-    """
-    Handle periodic ESP32 status messages.
-    """
+    """Store a device status event in PostgreSQL."""
 
-    device_sessions[device_id]["last_seen"] = utc_timestamp()
+    server_time = utc_timestamp()
+    message["server_timestamp"] = server_time
 
-    logger.info(
-        "Status from %s | RSSI=%s | IP=%s | IR=%s | video=%s",
-        device_id,
-        message.get("wifi", {}).get("rssi"),
-        message.get("wifi", {}).get("ip"),
-        message.get("sensor", {}).get("ir"),
-        message.get("video", {}).get("source"),
-    )
+    device_sessions[device_id]["last_seen"] = server_time
+
+    try:
+        event_id = insert_event(
+            device_id=device_id,
+            event_type="status",
+            event_time=parse_timestamp(message.get("timestamp")),
+            payload=message,
+        )
+
+        update_last_seen(device_id)
+
+        logger.info(
+            "Status from %s stored as event %s | "
+            "RSSI=%s | IP=%s | IR=%s | video=%s",
+            device_id,
+            event_id,
+            message.get("wifi", {}).get("rssi"),
+            message.get("wifi", {}).get("ip"),
+            message.get("sensor", {}).get("ir"),
+            message.get("video", {}).get("source"),
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Failed to store status event from %s: %s",
+            device_id,
+            exc,
+        )
 
 
 # ============================================================
@@ -666,15 +574,6 @@ async def handle_video_frame(
         utc_timestamp()
     )
 
-    # --------------------------------------------------------
-    # Log video frame
-    # --------------------------------------------------------
-
-    append_jsonl(
-        VIDEO_LOG,
-        frame_info,
-    )
-
     logger.info(
         "JPEG frame from %s | source=%s | "
         "frame=%s | size=%d bytes",
@@ -694,35 +593,47 @@ async def handle_video_status(
     device_id,
     message,
 ):
-    """
-    Handle video_status messages from ESP32.
-    """
+    """Store a video-source status event in PostgreSQL."""
 
-    source = message.get(
-        "source",
-        "unknown",
-    )
+    server_time = utc_timestamp()
+    message["server_timestamp"] = server_time
 
-    camera_enabled = message.get(
-        "camera_enabled",
-        False,
-    )
+    device_sessions[device_id]["last_seen"] = server_time
 
+    source = message.get("source", "unknown")
+    camera_enabled = message.get("camera_enabled", False)
     camera_initialized = message.get(
         "camera_initialized",
         False,
     )
 
-    logger.info(
-        "Video status from %s | "
-        "source=%s | "
-        "camera_enabled=%s | "
-        "camera_initialized=%s",
-        device_id,
-        source,
-        camera_enabled,
-        camera_initialized,
-    )
+    try:
+        event_id = insert_event(
+            device_id=device_id,
+            event_type="video_status",
+            event_time=parse_timestamp(message.get("timestamp")),
+            payload=message,
+        )
+
+        update_last_seen(device_id)
+
+        logger.info(
+            "Video status from %s stored as event %s | "
+            "source=%s | camera_enabled=%s | "
+            "camera_initialized=%s",
+            device_id,
+            event_id,
+            source,
+            camera_enabled,
+            camera_initialized,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Failed to store video status from %s: %s",
+            device_id,
+            exc,
+        )
 
 
 # ============================================================
@@ -1083,6 +994,30 @@ async def monitor_devices():
 
 
 # ============================================================
+# DATABASE
+# ============================================================
+
+def check_database():
+    """Verify that PostgreSQL is reachable before starting WSS."""
+
+    try:
+        # Importing here keeps database startup errors explicit.
+        from db import get_connection
+
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+
+        logger.info("PostgreSQL connection OK")
+
+    except Exception as exc:
+        raise RuntimeError(
+            f"PostgreSQL connection failed: {exc}"
+        ) from exc
+
+
+# ============================================================
 # TLS
 # ============================================================
 
@@ -1152,6 +1087,12 @@ async def main():
         "Frame directory: %s",
         FRAME_DIR,
     )
+
+    # --------------------------------------------------------
+    # PostgreSQL
+    # --------------------------------------------------------
+
+    check_database()
 
     # --------------------------------------------------------
     # TLS
