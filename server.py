@@ -6,6 +6,7 @@ import logging
 import ssl
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import websockets
 
@@ -22,6 +23,8 @@ from db import (
 
 HOST = "0.0.0.0"
 PORT = 8766
+HTTP_PORT = 8765
+HTTP_STREAM_PATH = "/video"
 
 WEBSOCKET_PATH = "/parking"
 
@@ -71,6 +74,12 @@ device_sessions = {}
 # device_id -> latest video metadata
 latest_frames = {}
 
+# device_id -> latest frame bytes and sequence number
+latest_stream_frames = {}
+
+# device_id -> notifies waiting HTTP stream clients
+frame_update_conditions = {}
+
 # websocket -> pending video metadata
 # The ESP32 sends:
 #
@@ -113,6 +122,16 @@ def parse_timestamp(value):
             value,
         )
         return None
+
+
+def get_frame_condition(device_id):
+    condition = frame_update_conditions.get(device_id)
+
+    if condition is None:
+        condition = asyncio.Condition()
+        frame_update_conditions[device_id] = condition
+
+    return condition
 
 
 # ============================================================
@@ -574,6 +593,26 @@ async def handle_video_frame(
         utc_timestamp()
     )
 
+    previous_stream_frame = latest_stream_frames.get(
+        device_id
+    )
+
+    next_sequence = (
+        1
+        if previous_stream_frame is None
+        else previous_stream_frame["sequence"] + 1
+    )
+
+    latest_stream_frames[device_id] = {
+        "sequence": next_sequence,
+        "jpeg": binary_data,
+    }
+
+    frame_condition = get_frame_condition(device_id)
+
+    async with frame_condition:
+        frame_condition.notify_all()
+
     logger.info(
         "JPEG frame from %s | source=%s | "
         "frame=%s | size=%d bytes",
@@ -634,6 +673,217 @@ async def handle_video_status(
             device_id,
             exc,
         )
+
+
+# ============================================================
+# HTTP MJPEG STREAM
+# ============================================================
+
+async def send_http_response(
+    writer,
+    status_code,
+    reason,
+    body,
+):
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+
+    headers = [
+        f"HTTP/1.1 {status_code} {reason}",
+        "Content-Type: text/plain; charset=utf-8",
+        f"Content-Length: {len(body)}",
+        "Connection: close",
+        "",
+        "",
+    ]
+
+    writer.write(
+        "\r\n".join(headers).encode("ascii")
+    )
+    writer.write(body)
+    await writer.drain()
+
+
+async def handle_http_stream_client(
+    reader,
+    writer,
+):
+    client_address = writer.get_extra_info("peername")
+
+    try:
+        request_line = await reader.readline()
+
+        if not request_line:
+            return
+
+        try:
+            request_text = request_line.decode(
+                "ascii"
+            ).strip()
+        except UnicodeDecodeError:
+            await send_http_response(
+                writer,
+                400,
+                "Bad Request",
+                "Invalid request line",
+            )
+            return
+
+        parts = request_text.split(" ")
+
+        if len(parts) != 3:
+            await send_http_response(
+                writer,
+                400,
+                "Bad Request",
+                "Malformed request line",
+            )
+            return
+
+        method, target, _ = parts
+
+        while True:
+            header_line = await reader.readline()
+
+            if not header_line:
+                break
+
+            if header_line in (b"\r\n", b"\n"):
+                break
+
+        if method != "GET":
+            await send_http_response(
+                writer,
+                405,
+                "Method Not Allowed",
+                "Only GET is supported",
+            )
+            return
+
+        parsed_target = urlsplit(target)
+
+        if parsed_target.path != HTTP_STREAM_PATH:
+            await send_http_response(
+                writer,
+                404,
+                "Not Found",
+                "Unknown endpoint",
+            )
+            return
+
+        query_params = parse_qs(
+            parsed_target.query
+        )
+
+        device_id = query_params.get(
+            "device_id",
+            [None],
+        )[0]
+
+        if not device_id:
+            await send_http_response(
+                writer,
+                400,
+                "Bad Request",
+                "Missing required query parameter: device_id",
+            )
+            return
+
+        boundary = "frame"
+        headers = [
+            "HTTP/1.1 200 OK",
+            "Cache-Control: no-cache",
+            "Pragma: no-cache",
+            "Connection: close",
+            (
+                "Content-Type: "
+                f"multipart/x-mixed-replace; boundary={boundary}"
+            ),
+            "",
+            "",
+        ]
+
+        writer.write(
+            "\r\n".join(headers).encode("ascii")
+        )
+        await writer.drain()
+
+        logger.info(
+            "HTTP stream connected from %s for %s",
+            client_address,
+            device_id,
+        )
+
+        last_sequence = 0
+
+        while True:
+            latest_frame = latest_stream_frames.get(
+                device_id
+            )
+
+            if (
+                latest_frame is None
+                or latest_frame["sequence"] <= last_sequence
+            ):
+                condition = get_frame_condition(
+                    device_id
+                )
+
+                async with condition:
+                    latest_frame = latest_stream_frames.get(
+                        device_id
+                    )
+                    if (
+                        latest_frame is None
+                        or latest_frame["sequence"] <= last_sequence
+                    ):
+                        await condition.wait()
+                continue
+
+            jpeg_data = latest_frame["jpeg"]
+            last_sequence = latest_frame["sequence"]
+
+            part_headers = [
+                f"--{boundary}",
+                "Content-Type: image/jpeg",
+                f"Content-Length: {len(jpeg_data)}",
+                f"X-Frame-Sequence: {last_sequence}",
+                "",
+                "",
+            ]
+
+            writer.write(
+                "\r\n".join(part_headers).encode("ascii")
+            )
+            writer.write(jpeg_data)
+            writer.write(b"\r\n")
+            await writer.drain()
+
+    except asyncio.CancelledError:
+        raise
+    except (
+        ConnectionResetError,
+        BrokenPipeError,
+    ):
+        pass
+    except Exception as exc:
+        logger.warning(
+            "HTTP stream error for %s: %s",
+            client_address,
+            exc,
+        )
+    finally:
+        logger.info(
+            "HTTP stream disconnected from %s",
+            client_address,
+        )
+
+        writer.close()
+
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -1084,6 +1334,13 @@ async def main():
     )
 
     logger.info(
+        "HTTP stream endpoint: %s:%d%s",
+        HOST,
+        HTTP_PORT,
+        HTTP_STREAM_PATH,
+    )
+
+    logger.info(
         "Frame directory: %s",
         FRAME_DIR,
     )
@@ -1122,6 +1379,18 @@ async def main():
             "WSS server started successfully"
         )
 
+        http_server = await asyncio.start_server(
+            handle_http_stream_client,
+            HOST,
+            HTTP_PORT,
+        )
+
+        logger.info(
+            "HTTP stream server started on %s:%d",
+            HOST,
+            HTTP_PORT,
+        )
+
         logger.info(
             "Waiting for ESP32 devices..."
         )
@@ -1143,6 +1412,9 @@ async def main():
                 await monitor_task
             except asyncio.CancelledError:
                 pass
+
+            http_server.close()
+            await http_server.wait_closed()
 
 
 # ============================================================
