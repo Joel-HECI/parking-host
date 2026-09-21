@@ -859,12 +859,13 @@ async def handle_http_stream_client(
             writer.write(b"\r\n")
             await writer.drain()
 
+    except asyncio.CancelledError:
+        raise
     except (
-        asyncio.CancelledError,
         ConnectionResetError,
         BrokenPipeError,
     ):
-        raise
+        pass
     except Exception as exc:
         logger.warning(
             "HTTP stream error for %s: %s",
