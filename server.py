@@ -5,11 +5,12 @@ import json
 import logging
 import ssl
 import threading
+import time
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import websockets
 from PIL import Image
@@ -28,7 +29,7 @@ from db import (
 HOST = "0.0.0.0"
 PORT = 8766
 
-# Development HTTP server for the converted JPEG frames.
+# Development HTTP server for live video and latest JPEG frames.
 HTTP_HOST = "0.0.0.0"
 HTTP_PORT = 8080
 
@@ -41,9 +42,7 @@ DATA_DIR = Path("data")
 FRAME_DIR = DATA_DIR / "frames"
 
 AUTH_TIMEOUT = 10
-
 PING_INTERVAL = 15
-
 MAX_MESSAGE_SIZE = 5 * 1024 * 1024
 
 # RHYX M21-45 / ESP32 camera RGB565 byte order.
@@ -52,6 +51,10 @@ MAX_MESSAGE_SIZE = 5 * 1024 * 1024
 # little-endian representation expected by Pillow's BGR;16 decoder.
 RGB565_BYTE_ORDER = "big"
 JPEG_QUALITY = 85
+
+HTTP_STREAM_BOUNDARY = "parking-stream"
+HTTP_STREAM_TIMEOUT = 30.0
+HTTP_FRAME_CACHE_TTL = 60.0
 
 
 # ============================================================
@@ -99,10 +102,14 @@ pending_video_metadata = {}
 # Background HTTP server used to serve the latest JPEG frames.
 http_server = None
 
+# Shared lock to keep HTTP polling and MJPEG streaming consistent.
+http_cache_lock = threading.Lock()
+
 
 # ============================================================
 # TIME
 # ============================================================
+
 
 def utc_timestamp():
     """
@@ -312,6 +319,7 @@ async def authenticate(websocket):
 # PATH VALIDATION
 # ============================================================
 
+
 def get_websocket_path(websocket):
     """
     Obtain the requested WebSocket path.
@@ -431,6 +439,7 @@ async def handle_status_message(
 # RGB565 -> JPEG
 # ============================================================
 
+
 def rgb565_to_jpeg(
     binary_data: bytes,
     width: int,
@@ -483,8 +492,6 @@ def rgb565_to_jpeg(
         "BGR;16",
     )
 
-    output = bytearray()
-
     # Pillow requires a file-like object for JPEG encoding.
     from io import BytesIO
 
@@ -501,81 +508,429 @@ def rgb565_to_jpeg(
 
 
 # ============================================================
+# HTTP VIDEO CACHE
+# ============================================================
+
+
+def get_cached_frame_bytes(device_id: str):
+    """Return the newest JPEG image bytes for a device without reading disk."""
+
+    with http_cache_lock:
+        info = latest_frames.get(device_id)
+        if info is not None:
+            jpeg_bytes = info.get("jpeg_bytes")
+            if jpeg_bytes:
+                return jpeg_bytes
+
+        frame_path = FRAME_DIR / f"{device_id}.jpg"
+        try:
+            if frame_path.is_file():
+                return frame_path.read_bytes()
+        except OSError:
+            logger.warning(
+                "Failed to read frame cache for device %s",
+                device_id,
+            )
+
+        return None
+
+
+def get_all_device_ids():
+    """List known device IDs in the current cache or by frame files."""
+
+    ids = set(latest_frames.keys())
+
+    try:
+        for path in FRAME_DIR.glob("*.jpg"):
+            ids.add(path.stem)
+    except OSError:
+        pass
+
+    return sorted(ids)
+
+
+def _device_id_from_path(path: str):
+    """Validate a requested device ID from the HTTP path."""
+
+    device_id = path.strip("/")
+    device_id = unquote(device_id)
+
+    if not device_id:
+        return None
+
+    if device_id in (".", ".."):
+        return None
+
+    if "/" in device_id or "\\" in device_id:
+        return None
+
+    return device_id
+
+
+# ============================================================
 # HTTP JPEG SERVER
 # ============================================================
 
+
 class FrameHTTPHandler(BaseHTTPRequestHandler):
     """
-    Development HTTP endpoint for the latest JPEG frames.
+    Development HTTP endpoint for live video streaming and latest JPEG frames.
 
-    Example:
+    Supported routes:
 
-        http://HOST:8080/frames/PARKING-ESP32-001.jpg
+        /                         -> browser demo page
+        /frames/<device_id>.jpg -> latest JPEG still image
+        /video/<device_id>.mjpg -> MJPEG live stream
+        /api/devices            -> JSON device list
     """
 
-    server_version = "ParkingFrameServer/1.0"
+    server_version = "ParkingFrameServer/2.0"
+    protocol_version = "HTTP/1.1"
+
+    def _send_json(self, payload, status=HTTPStatus.OK):
+        body = (json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_index(self):
+        html = """
+        <!doctype html>
+        <html lang="en">
+        <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Parking Live Feed</title>
+            <style>
+                :root {
+                    --bg: #0b1220;
+                    --panel: #121b2b;
+                    --panel-alt: #1b2942;
+                    --edge: #2a3d5a;
+                    --text: #e5eefb;
+                    --muted: #9bb0d0;
+                    --accent: #67d1ff;
+                }
+                * { box-sizing: border-box; }
+                body {
+                    margin: 0;
+                    font-family: system-ui, sans-serif;
+                    background: linear-gradient(180deg, var(--bg), #0f172a);
+                    color: var(--text);
+                }
+                .wrap {
+                    max-width: 1120px;
+                    margin: 24px auto;
+                    padding: 20px;
+                }
+                .toolbar {
+                    display: flex;
+                    gap: 12px;
+                    align-items: center;
+                    flex-wrap: wrap;
+                    margin-bottom: 16px;
+                    padding: 12px 16px;
+                    background: rgba(18,27,43,0.9);
+                    border: 1px solid var(--edge);
+                    border-radius: 12px;
+                }
+                select {
+                    background: var(--panel-alt);
+                    color: var(--text);
+                    border: 1px solid var(--edge);
+                    border-radius: 8px;
+                    padding: 10px 14px;
+                    font-size: 16px;
+                    min-width: 220px;
+                }
+                .badge {
+                    background: rgba(103, 209, 255, 0.12);
+                    border: 1px solid rgba(103, 209, 255, 0.4);
+                    color: var(--accent);
+                    border-radius: 999px;
+                    padding: 6px 10px;
+                    font-size: 12px;
+                    text-transform: uppercase;
+                    letter-spacing: 0.08em;
+                }
+                .video-shell {
+                    background: rgba(18,27,43,0.9);
+                    border: 1px solid var(--edge);
+                    border-radius: 16px;
+                    overflow: hidden;
+                    box-shadow: 0 20px 45px rgba(0,0,0,0.25);
+                }
+                img {
+                    display: block;
+                    width: 100%;
+                    height: auto;
+                    background: #000;
+                    min-height: 240px;
+                    object-fit: contain;
+                }
+                .status {
+                    padding: 10px 14px;
+                    color: var(--muted);
+                    font-size: 13px;
+                    border-top: 1px solid var(--edge);
+                    background: rgba(9,14,23,0.7);
+                }
+            </style>
+        </head>
+        <body>
+            <div class="wrap">
+                <div class="toolbar">
+                    <label for="deviceSelect">Camera:</label>
+                    <select id="deviceSelect"></select>
+                    <span class="badge">MJPEG stream</span>
+                </div>
+
+                <div class="video-shell">
+                    <img id="video" alt="Parking camera stream" src="/video/PARKING-ESP32-001.mjpg">
+                    <div class="status" id="statusText">Connecting to stream…</div>
+                </div>
+            </div>
+
+            <script>
+                const select = document.getElementById('deviceSelect');
+                const video = document.getElementById('video');
+                const statusText = document.getElementById('statusText');
+                let lastDevice = null;
+
+                function updateVideoSource(deviceId) {
+                    if (!deviceId) return;
+                    const src = `/video/${encodeURIComponent(deviceId)}.mjpg?cacheBust=${Date.now()}`;
+                    video.src = src;
+                    lastDevice = deviceId;
+                    statusText.textContent = `Streaming ${deviceId}`;
+                }
+
+                async function refreshDevices() {
+                    try {
+                        const res = await fetch('/api/devices', { cache: 'no-store' });
+                        if (!res.ok) throw new Error('devices unavailable');
+                        const devices = await res.json();
+                        const items = devices.devices || [];
+
+                        const current = select.value || lastDevice || items[0] || '';
+                        select.innerHTML = '';
+
+                        if (!items.length) {
+                            const option = new Option('No devices connected', '');
+                            select.appendChild(option);
+                            statusText.textContent = 'No device is currently connected.';
+                            return;
+                        }
+
+                        for (const deviceId of items) {
+                            const option = new Option(deviceId, deviceId);
+                            if (deviceId === current) option.selected = true;
+                            select.appendChild(option);
+                        }
+
+                        if (!items.includes(current)) {
+                            updateVideoSource(items[0]);
+                        } else {
+                            updateVideoSource(current);
+                        }
+                    } catch (err) {
+                        statusText.textContent = 'Unable to load device list.';
+                    }
+                }
+
+                select.addEventListener('change', (event) => {
+                    updateVideoSource(event.target.value);
+                });
+
+                video.addEventListener('error', () => {
+                    statusText.textContent = 'Stream unavailable. Waiting for camera…';
+                });
+
+                video.addEventListener('load', () => {
+                    statusText.textContent = `Streaming ${lastDevice || 'device'}`;
+                });
+
+                refreshDevices();
+                setInterval(refreshDevices, 5000);
+            </script>
+        </body>
+        </html>
+        """.strip()
+
+        body = html.encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
 
     def _send_frame(self, send_body=True):
         parsed = urlparse(self.path)
+        path = parsed.path
 
-        if not parsed.path.startswith("/frames/"):
+        if not path.startswith("/frames/"):
             self.send_error(
                 HTTPStatus.NOT_FOUND,
                 "Use /frames/<device_id>.jpg",
             )
             return
 
-        filename = unquote(
-            parsed.path[len("/frames/"):]
-        )
-
-        # Only serve a single filename. This prevents path traversal.
-        if (
-            not filename
-            or filename in (".", "..")
-            or Path(filename).name != filename
-            or not filename.lower().endswith(".jpg")
-        ):
+        device_id = _device_id_from_path(path[len("/frames/"):])
+        if not device_id:
             self.send_error(
                 HTTPStatus.BAD_REQUEST,
                 "Invalid frame filename",
             )
             return
 
-        frame_path = FRAME_DIR / filename
+        frame_data = get_cached_frame_bytes(device_id)
 
-        if not frame_path.is_file():
+        if not frame_data:
             self.send_error(
                 HTTPStatus.NOT_FOUND,
                 "Frame not available",
             )
             return
 
-        try:
-            data = frame_path.read_bytes()
-        except OSError:
-            self.send_error(
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-                "Failed to read frame",
-            )
-            return
-
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "image/jpeg")
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Length", str(len(frame_data)))
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.send_header("Pragma", "no-cache")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
         if send_body:
-            self.wfile.write(data)
+            self.wfile.write(frame_data)
+
+    def _stream_mjpeg(self, device_id: str):
+        boundary = f"--{HTTP_STREAM_BOUNDARY}".encode("ascii")
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header(
+            "Content-Type",
+            f"multipart/x-mixed-replace; boundary={HTTP_STREAM_BOUNDARY}",
+        )
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        self.wfile.write(b"\r\n")
+        self.wfile.flush()
+
+        start_time = time.monotonic()
+        last_frame = None
+
+        while True:
+            if self.connection is None:
+                break
+
+            frame_data = get_cached_frame_bytes(device_id)
+            if frame_data:
+                last_frame = frame_data
+
+            if last_frame:
+                payload = (
+                    boundary + b"\r\n"
+                    + b"Content-Type: image/jpeg\r\n"
+                    + f"Content-Length: {len(last_frame)}\r\n\r\n".encode("ascii")
+                    + last_frame
+                    + b"\r\n"
+                )
+                try:
+                    self.wfile.write(payload)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    logger.info("MJPEG client disconnected for %s", device_id)
+                    break
+
+            elapsed = time.monotonic() - start_time
+            if elapsed >= HTTP_STREAM_TIMEOUT:
+                logger.info("MJPEG stream timed out for %s", device_id)
+                break
+
+            time.sleep(0.1)
+
+    def _api_devices(self):
+        device_ids = get_all_device_ids()
+        self._send_json({"devices": device_ids})
 
     def do_GET(self):
-        self._send_frame(send_body=True)
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/" or path == "/index.html":
+            self._serve_index()
+            return
+
+        if path == "/api/devices":
+            self._api_devices()
+            return
+
+        if path.startswith("/video/"):
+            device_id = _device_id_from_path(path[len("/video/") :])
+            if device_id is None or not device_id.endswith(".mjpg"):
+                self.send_error(
+                    HTTPStatus.BAD_REQUEST,
+                    "Use /video/<device_id>.mjpg",
+                )
+                return
+
+            device_id = device_id[:-5]
+            if not device_id:
+                self.send_error(
+                    HTTPStatus.BAD_REQUEST,
+                    "Invalid device identifier",
+                )
+                return
+
+            self._stream_mjpeg(device_id)
+            return
+
+        if path.startswith("/frames/"):
+            self._send_frame(send_body=True)
+            return
+
+        self.send_error(
+            HTTPStatus.NOT_FOUND,
+            "Unknown HTTP route",
+        )
 
     def do_HEAD(self):
-        self._send_frame(send_body=False)
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path.startswith("/frames/"):
+            self._send_frame(send_body=False)
+            return
+
+        if path.startswith("/video/"):
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=parking-stream")
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            return
+
+        if path == "/api/devices":
+            self._api_devices()
+            return
+
+        self.send_error(
+            HTTPStatus.NOT_FOUND,
+            "Unknown HTTP route",
+        )
 
     def log_message(self, format, *args):
         logger.info(
@@ -586,7 +941,7 @@ class FrameHTTPHandler(BaseHTTPRequestHandler):
 
 
 def start_http_server():
-    """Start the development JPEG HTTP server in a background thread."""
+    """Start the development HTTP server in a background thread."""
 
     global http_server
 
@@ -604,14 +959,14 @@ def start_http_server():
     thread.start()
 
     logger.info(
-        "JPEG HTTP server listening on http://%s:%d",
+        "HTTP video server listening on http://%s:%d",
         HTTP_HOST,
         HTTP_PORT,
     )
 
 
 def stop_http_server():
-    """Stop the development JPEG HTTP server."""
+    """Stop the development HTTP server."""
 
     global http_server
 
@@ -842,6 +1197,8 @@ async def handle_video_frame(
         "raw_size": raw_size,
         "jpeg_size": len(jpeg_data),
         "path": str(frame_path),
+        "jpeg_bytes": jpeg_data,
+        "updated_at": time.time(),
     }
 
     if width is not None:
@@ -1285,6 +1642,7 @@ async def monitor_devices():
 # DATABASE
 # ============================================================
 
+
 def check_database():
     """Verify that PostgreSQL is reachable before starting WSS."""
 
@@ -1308,6 +1666,7 @@ def check_database():
 # ============================================================
 # TLS
 # ============================================================
+
 
 def create_ssl_context():
 
