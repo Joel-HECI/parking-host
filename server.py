@@ -4,10 +4,15 @@ import asyncio
 import json
 import logging
 import ssl
+import threading
 from datetime import datetime, timezone
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import websockets
+from PIL import Image
 
 from db import (
     authenticate_device,
@@ -23,6 +28,10 @@ from db import (
 HOST = "0.0.0.0"
 PORT = 8766
 
+# Development HTTP server for the converted JPEG frames.
+HTTP_HOST = "0.0.0.0"
+HTTP_PORT = 8080
+
 WEBSOCKET_PATH = "/parking"
 
 SERVER_CERT = Path("certs/server.crt")
@@ -36,6 +45,13 @@ AUTH_TIMEOUT = 10
 PING_INTERVAL = 15
 
 MAX_MESSAGE_SIZE = 5 * 1024 * 1024
+
+# RHYX M21-45 / ESP32 camera RGB565 byte order.
+# Espressif documents the camera framebuffer RGB565 output as MSB-first
+# (big-endian). The converter below swaps each 16-bit pixel into the
+# little-endian representation expected by Pillow's BGR;16 decoder.
+RGB565_BYTE_ORDER = "big"
+JPEG_QUALITY = 85
 
 
 # ============================================================
@@ -79,6 +95,9 @@ latest_frames = {}
 #
 # We temporarily associate the metadata with the connection.
 pending_video_metadata = {}
+
+# Background HTTP server used to serve the latest JPEG frames.
+http_server = None
 
 
 # ============================================================
@@ -409,6 +428,200 @@ async def handle_status_message(
 
 
 # ============================================================
+# RGB565 -> JPEG
+# ============================================================
+
+def rgb565_to_jpeg(
+    binary_data: bytes,
+    width: int,
+    height: int,
+    byte_order: str = RGB565_BYTE_ORDER,
+    quality: int = JPEG_QUALITY,
+) -> bytes:
+    """
+    Convert a raw RGB565 framebuffer to JPEG.
+
+    The ESP32 sends two bytes per pixel. The RHYX M21-45 stream is
+    expected to be RGB565, so the host converts it to RGB and then
+    encodes it as JPEG for browsers and other HTTP clients.
+    """
+
+    if width <= 0 or height <= 0:
+        raise ValueError("RGB565 frame dimensions must be positive")
+
+    expected_size = width * height * 2
+
+    if len(binary_data) != expected_size:
+        raise ValueError(
+            f"Invalid RGB565 frame size: received {len(binary_data)} "
+            f"bytes, expected {expected_size} for {width}x{height}"
+        )
+
+    if byte_order not in ("big", "little"):
+        raise ValueError(
+            "RGB565 byte order must be 'big' or 'little'"
+        )
+
+    # Pillow's BGR;16 decoder expects little-endian 16-bit words.
+    # The ESP32 camera RGB565 framebuffer is MSB-first by default, so
+    # swap each 16-bit pixel when receiving big-endian RGB565.
+    if byte_order == "big":
+        pixel_data = bytearray(binary_data)
+        pixel_data[0::2], pixel_data[1::2] = (
+            pixel_data[1::2],
+            pixel_data[0::2],
+        )
+        pixel_data = bytes(pixel_data)
+    else:
+        pixel_data = binary_data
+
+    image = Image.frombytes(
+        "RGB",
+        (width, height),
+        pixel_data,
+        "raw",
+        "BGR;16",
+    )
+
+    output = bytearray()
+
+    # Pillow requires a file-like object for JPEG encoding.
+    from io import BytesIO
+
+    buffer = BytesIO()
+
+    image.save(
+        buffer,
+        format="JPEG",
+        quality=quality,
+        optimize=True,
+    )
+
+    return buffer.getvalue()
+
+
+# ============================================================
+# HTTP JPEG SERVER
+# ============================================================
+
+class FrameHTTPHandler(BaseHTTPRequestHandler):
+    """
+    Development HTTP endpoint for the latest JPEG frames.
+
+    Example:
+
+        http://HOST:8080/frames/PARKING-ESP32-001.jpg
+    """
+
+    server_version = "ParkingFrameServer/1.0"
+
+    def _send_frame(self, send_body=True):
+        parsed = urlparse(self.path)
+
+        if not parsed.path.startswith("/frames/"):
+            self.send_error(
+                HTTPStatus.NOT_FOUND,
+                "Use /frames/<device_id>.jpg",
+            )
+            return
+
+        filename = unquote(
+            parsed.path[len("/frames/"):]
+        )
+
+        # Only serve a single filename. This prevents path traversal.
+        if (
+            not filename
+            or filename in (".", "..")
+            or Path(filename).name != filename
+            or not filename.lower().endswith(".jpg")
+        ):
+            self.send_error(
+                HTTPStatus.BAD_REQUEST,
+                "Invalid frame filename",
+            )
+            return
+
+        frame_path = FRAME_DIR / filename
+
+        if not frame_path.is_file():
+            self.send_error(
+                HTTPStatus.NOT_FOUND,
+                "Frame not available",
+            )
+            return
+
+        try:
+            data = frame_path.read_bytes()
+        except OSError:
+            self.send_error(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "Failed to read frame",
+            )
+            return
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        if send_body:
+            self.wfile.write(data)
+
+    def do_GET(self):
+        self._send_frame(send_body=True)
+
+    def do_HEAD(self):
+        self._send_frame(send_body=False)
+
+    def log_message(self, format, *args):
+        logger.info(
+            "HTTP %s - %s",
+            self.address_string(),
+            format % args,
+        )
+
+
+def start_http_server():
+    """Start the development JPEG HTTP server in a background thread."""
+
+    global http_server
+
+    http_server = ThreadingHTTPServer(
+        (HTTP_HOST, HTTP_PORT),
+        FrameHTTPHandler,
+    )
+
+    thread = threading.Thread(
+        target=http_server.serve_forever,
+        name="jpeg-http-server",
+        daemon=True,
+    )
+
+    thread.start()
+
+    logger.info(
+        "JPEG HTTP server listening on http://%s:%d",
+        HTTP_HOST,
+        HTTP_PORT,
+    )
+
+
+def stop_http_server():
+    """Stop the development JPEG HTTP server."""
+
+    global http_server
+
+    if http_server is not None:
+        http_server.shutdown()
+        http_server.server_close()
+        http_server = None
+
+
+# ============================================================
 # VIDEO METADATA
 # ============================================================
 
@@ -418,18 +631,21 @@ async def handle_video_metadata(
     message,
 ):
     """
-    Receive metadata for the next JPEG frame.
+    Receive metadata for the next video frame.
 
     The ESP32 sends:
 
         TEXT:
         {
             "type": "video_frame",
+            "format": "rgb565",
+            "width": 320,
+            "height": 240,
             ...
         }
 
         BINARY:
-        <JPEG>
+        <raw RGB565>
 
     """
 
@@ -464,31 +680,13 @@ async def handle_video_frame(
     binary_data,
 ):
     """
-    Handle a binary JPEG frame.
+    Handle a binary video frame.
+
+    Supported formats:
+
+        jpeg   -> stored directly as JPEG
+        rgb565 -> converted to JPEG on the host, then stored
     """
-
-    # --------------------------------------------------------
-    # Validate JPEG
-    # --------------------------------------------------------
-
-    if len(binary_data) < 4:
-
-        logger.warning(
-            "Ignoring very small binary frame from %s",
-            device_id,
-        )
-
-        return
-
-    # JPEG SOI marker
-    if binary_data[0:2] != b"\xff\xd8":
-
-        logger.warning(
-            "Binary frame from %s is not a JPEG",
-            device_id,
-        )
-
-        return
 
     # --------------------------------------------------------
     # Get metadata
@@ -502,14 +700,11 @@ async def handle_video_frame(
     if metadata is None:
 
         logger.warning(
-            "JPEG received from %s without metadata",
+            "Binary frame received from %s without metadata",
             device_id,
         )
 
-        metadata = {
-            "type": "video_frame",
-            "source": "unknown",
-        }
+        return
 
     source = metadata.get(
         "source",
@@ -526,8 +721,85 @@ async def handle_video_frame(
         utc_timestamp(),
     )
 
+    frame_format = str(
+        metadata.get(
+            "format",
+            "jpeg",
+        )
+    ).lower()
+
     # --------------------------------------------------------
-    # Save latest frame
+    # Convert / validate frame
+    # --------------------------------------------------------
+
+    if frame_format == "rgb565":
+
+        try:
+            width = int(metadata["width"])
+            height = int(metadata["height"])
+
+            byte_order = str(
+                metadata.get(
+                    "byte_order",
+                    RGB565_BYTE_ORDER,
+                )
+            ).lower()
+
+            jpeg_data = rgb565_to_jpeg(
+                binary_data,
+                width,
+                height,
+                byte_order=byte_order,
+                quality=JPEG_QUALITY,
+            )
+
+        except (KeyError, TypeError, ValueError) as exc:
+
+            logger.warning(
+                "Invalid RGB565 frame from %s: %s",
+                device_id,
+                exc,
+            )
+
+            return
+
+        output_format = "rgb565"
+        raw_size = len(binary_data)
+
+    elif frame_format == "jpeg":
+
+        # ----------------------------------------------------
+        # Validate JPEG SOI marker.
+        # ----------------------------------------------------
+
+        if len(binary_data) < 4 or binary_data[0:2] != b"\xff\xd8":
+
+            logger.warning(
+                "Binary frame from %s is not a valid JPEG",
+                device_id,
+            )
+
+            return
+
+        jpeg_data = binary_data
+        output_format = "jpeg"
+        raw_size = len(binary_data)
+
+        width = metadata.get("width")
+        height = metadata.get("height")
+
+    else:
+
+        logger.warning(
+            "Unsupported video format from %s: %s",
+            device_id,
+            frame_format,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Save latest frame as JPEG
     # --------------------------------------------------------
 
     frame_path = (
@@ -542,7 +814,7 @@ async def handle_video_frame(
             "wb",
         ) as file:
 
-            file.write(binary_data)
+            file.write(jpeg_data)
 
     except Exception as exc:
 
@@ -558,29 +830,45 @@ async def handle_video_frame(
     # Update state
     # --------------------------------------------------------
 
+    server_timestamp = utc_timestamp()
+
     frame_info = {
         "device_id": device_id,
         "source": source,
+        "format": output_format,
         "frame_id": frame_id,
         "timestamp": timestamp,
-        "server_timestamp": utc_timestamp(),
-        "size": len(binary_data),
+        "server_timestamp": server_timestamp,
+        "raw_size": raw_size,
+        "jpeg_size": len(jpeg_data),
         "path": str(frame_path),
     }
 
+    if width is not None:
+        frame_info["width"] = width
+
+    if height is not None:
+        frame_info["height"] = height
+
+    if frame_format == "rgb565":
+        frame_info["rgb565_byte_order"] = metadata.get(
+            "byte_order",
+            RGB565_BYTE_ORDER,
+        )
+
     latest_frames[device_id] = frame_info
 
-    device_sessions[device_id]["last_seen"] = (
-        utc_timestamp()
-    )
+    device_sessions[device_id]["last_seen"] = server_timestamp
 
     logger.info(
-        "JPEG frame from %s | source=%s | "
-        "frame=%s | size=%d bytes",
+        "Video frame from %s | source=%s | format=%s | "
+        "frame=%s | raw=%d bytes | JPEG=%d bytes",
         device_id,
         source,
+        frame_format,
         frame_id,
-        len(binary_data),
+        raw_size,
+        len(jpeg_data),
     )
 
 
@@ -1088,11 +1376,27 @@ async def main():
         FRAME_DIR,
     )
 
+    logger.info(
+        "JPEG quality: %d",
+        JPEG_QUALITY,
+    )
+
+    logger.info(
+        "RGB565 byte order: %s",
+        RGB565_BYTE_ORDER,
+    )
+
     # --------------------------------------------------------
     # PostgreSQL
     # --------------------------------------------------------
 
     check_database()
+
+    # --------------------------------------------------------
+    # HTTP JPEG server
+    # --------------------------------------------------------
+
+    start_http_server()
 
     # --------------------------------------------------------
     # TLS
@@ -1143,6 +1447,8 @@ async def main():
                 await monitor_task
             except asyncio.CancelledError:
                 pass
+
+            stop_http_server()
 
 
 # ============================================================
