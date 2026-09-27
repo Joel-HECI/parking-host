@@ -568,7 +568,7 @@ def _device_id_from_path(path: str):
 
 
 # ============================================================
-# HTTP JPEG SERVER
+# HTTPS VIDEO SERVER
 # ============================================================
 
 
@@ -588,12 +588,13 @@ class FrameHTTPHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def _send_json(self, payload, status=HTTPStatus.OK):
-        body = (json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
         self.send_header("Pragma", "no-cache")
+        self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
@@ -768,6 +769,7 @@ class FrameHTTPHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
         self.send_header("Pragma", "no-cache")
+        self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
@@ -805,6 +807,7 @@ class FrameHTTPHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(frame_data)))
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.send_header("Pragma", "no-cache")
+        self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
@@ -822,6 +825,7 @@ class FrameHTTPHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.send_header("Pragma", "no-cache")
         self.send_header("Connection", "keep-alive")
+        self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
@@ -940,8 +944,8 @@ class FrameHTTPHandler(BaseHTTPRequestHandler):
         )
 
 
-def start_http_server():
-    """Start the development HTTP server in a background thread."""
+def start_http_server(ssl_context):
+    """Start the development HTTPS server in a background thread."""
 
     global http_server
 
@@ -949,17 +953,21 @@ def start_http_server():
         (HTTP_HOST, HTTP_PORT),
         FrameHTTPHandler,
     )
+    http_server.socket = ssl_context.wrap_socket(
+        http_server.socket,
+        server_side=True,
+    )
 
     thread = threading.Thread(
         target=http_server.serve_forever,
-        name="jpeg-http-server",
+        name="https-video-server",
         daemon=True,
     )
 
     thread.start()
 
     logger.info(
-        "HTTP video server listening on http://%s:%d",
+        "HTTPS video server listening on https://%s:%d",
         HTTP_HOST,
         HTTP_PORT,
     )
@@ -1752,20 +1760,18 @@ async def main():
     check_database()
 
     # --------------------------------------------------------
-    # HTTP JPEG server
-    # --------------------------------------------------------
-
-    start_http_server()
-
-    # --------------------------------------------------------
     # TLS
     # --------------------------------------------------------
 
     ssl_context = create_ssl_context()
 
-    logger.info(
-        "TLS certificate loaded"
-    )
+    logger.info("TLS certificate loaded")
+
+    # --------------------------------------------------------
+    # HTTPS video server
+    # --------------------------------------------------------
+
+    start_http_server(ssl_context)
 
     # --------------------------------------------------------
     # Start WSS server

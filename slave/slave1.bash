@@ -1,0 +1,1 @@
+python make_secrets_bin.py --ssid TITAPUTIN --wifi-password Renegade#2025 --server-host 192.168.1.23 --server-port 8766 --server-path /parking --device-token EQRTaGx_kFcalO3eCjd_5qaBZjJV2MpMrqxuRhRTCSw --root-ca root_ca.pem --secrets-key-material qn0y3zFT2-7fjGIMlKyCbEnH1pqg0KX-tDjXC4SgA80 --out /home/joel/Arduino/wss_slave/data/secrets.bin
