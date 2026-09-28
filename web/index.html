@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Parking Live Feed</title>
+    <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+    <div class="wrap">
+        <div class="toolbar">
+            <label for="deviceSelect">Camera:</label>
+            <select id="deviceSelect"></select>
+            <span class="badge">MJPEG stream</span>
+            <a class="nav-link" href="/db">Open DB browser</a>
+            <div class="ir-status is-unknown" id="irStatus" aria-live="polite">
+                <span class="ir-led" id="irLed" aria-hidden="true"></span>
+                <span id="irLabel">IR sensor: unknown</span>
+            </div>
+        </div>
+
+        <div class="video-shell">
+            <img id="video" alt="Parking camera stream" src="/video/PARKING-ESP32-001.mjpg">
+            <div class="status" id="statusText">Connecting to stream…</div>
+        </div>
+    </div>
+
+    <script src="/app.js"></script>
+</body>
+</html>

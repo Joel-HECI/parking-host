@@ -50,6 +50,28 @@ def get_device(device_id: str):
             return cur.fetchone()
 
 
+def list_devices():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    device_id,
+                    name,
+                    spot,
+                    enabled,
+                    last_seen,
+                    metadata,
+                    created_at,
+                    updated_at
+                FROM devices
+                ORDER BY created_at DESC, device_id ASC
+                """
+            )
+            return cur.fetchall()
+
+
 def authenticate_device(
     device_id: str,
     token: str
@@ -191,3 +213,66 @@ def register_device(
             )
 
             return cur.fetchone()["id"]
+
+
+def delete_device(device_id: str):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM devices
+                WHERE device_id = %s
+                RETURNING id
+                """,
+                (device_id,)
+            )
+            row = cur.fetchone()
+            return row["id"] if row else None
+
+
+def list_events(
+    event_type: str | None = None,
+    device_id: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+):
+    clauses = []
+    params = []
+
+    if event_type:
+        clauses.append("e.event_type = %s")
+        params.append(event_type)
+
+    if device_id:
+        clauses.append("d.device_id = %s")
+        params.append(device_id)
+
+    where_sql = ""
+    if clauses:
+        where_sql = "WHERE " + " AND ".join(clauses)
+
+    params.extend([limit, offset])
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT
+                    e.id,
+                    d.device_id,
+                    d.name AS device_name,
+                    d.spot,
+                    e.event_type,
+                    e.event_time,
+                    e.received_at,
+                    e.payload,
+                    e.metadata
+                FROM events e
+                JOIN devices d ON d.id = e.device_id
+                {where_sql}
+                ORDER BY COALESCE(e.event_time, e.received_at) DESC, e.id DESC
+                LIMIT %s OFFSET %s
+                """,
+                tuple(params),
+            )
+            return cur.fetchall()

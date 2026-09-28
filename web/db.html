@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Parking DB Browser</title>
+    <link rel="stylesheet" href="/db.css">
+</head>
+<body>
+    <div class="page">
+        <header class="header">
+            <div>
+                <p class="eyebrow">Database browser</p>
+                <h1>Parking IoT data</h1>
+                <p class="subtitle">Browse device rows and event rows like a spreadsheet. Filter events by type or device, add devices, and remove devices from the database.</p>
+            </div>
+            <a class="back-link" href="/">Back to live feed</a>
+        </header>
+
+        <section class="panel">
+            <div class="panel-head">
+                <h2>Devices</h2>
+                <form id="deviceForm" class="inline-form">
+                    <input name="device_id" placeholder="device_id" required>
+                    <input name="token" placeholder="token" required>
+                    <input name="name" placeholder="name">
+                    <input name="spot" placeholder="spot">
+                    <button type="submit">Add device</button>
+                </form>
+            </div>
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>device_id</th>
+                            <th>name</th>
+                            <th>spot</th>
+                            <th>enabled</th>
+                            <th>last_seen</th>
+                            <th>created_at</th>
+                            <th>updated_at</th>
+                            <th>actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="deviceRows"></tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="panel">
+            <div class="panel-head">
+                <h2>Events</h2>
+                <div class="inline-form filters">
+                    <select id="eventTypeFilter">
+                        <option value="">All event types</option>
+                        <option value="sensor">sensor</option>
+                        <option value="status">status</option>
+                        <option value="video_status">video_status</option>
+                    </select>
+                    <select id="deviceFilter">
+                        <option value="">All devices</option>
+                    </select>
+                    <input id="limitInput" type="number" min="1" max="500" value="100" placeholder="limit">
+                    <button id="refreshEvents" type="button">Refresh</button>
+                </div>
+            </div>
+            <div class="table-wrap events-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>id</th>
+                            <th>device_id</th>
+                            <th>type</th>
+                            <th>event_time</th>
+                            <th>received_at</th>
+                            <th>details</th>
+                        </tr>
+                    </thead>
+                    <tbody id="eventRows"></tbody>
+                </table>
+            </div>
+        </section>
+
+        <div id="statusBar" class="status-bar">Loading…</div>
+    </div>
+
+    <script src="/db.js"></script>
+</body>
+</html>
